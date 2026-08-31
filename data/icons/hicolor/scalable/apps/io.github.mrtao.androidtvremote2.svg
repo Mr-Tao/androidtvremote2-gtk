@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Android TV Remote</title>
+  <g fill="none" fill-rule="evenodd">
+    <path fill="#20252b" d="M72 72h368c22 0 40 18 40 40v220c0 22-18 40-40 40h-92v-32h92c4 0 8-4 8-8V112c0-4-4-8-8-8H72c-4 0-8 4-8 8v220c0 4 4 8 8 8h92v32H72c-22 0-40-18-40-40V112c0-22 18-40 40-40Z"/>
+    <path fill="#0f9d9a" d="M72 112h368v220H72z"/>
+    <path fill="#20252b" d="m88 372-20 52h42l30-52zm336 0 20 52h-42l-30-52z"/>
+    <rect width="184" height="352" x="164" y="128" fill="#20252b" rx="40"/>
+    <circle cx="210" cy="176" r="22" fill="#ff665a"/>
+    <path stroke="#fff" stroke-linecap="round" stroke-width="8" d="M210 160v18m-12-10a17 17 0 1 0 24 0"/>
+    <circle cx="256" cy="270" r="72" fill="#f7f5ef"/>
+    <circle cx="256" cy="270" r="30" fill="#20252b"/>
+    <path fill="#20252b" d="m256 210 12 16h-24zm0 120 12-16h-24zm-60-60 16-12v24zm120 0-16-12v24z"/>
+    <circle cx="214" cy="378" r="13" fill="#f7f5ef"/>
+    <circle cx="256" cy="378" r="13" fill="#f7f5ef"/>
+    <circle cx="298" cy="378" r="13" fill="#f7f5ef"/>
+    <circle cx="214" cy="424" r="13" fill="#f7f5ef"/>
+    <circle cx="256" cy="424" r="13" fill="#f7f5ef"/>
+    <circle cx="298" cy="424" r="13" fill="#f7f5ef"/>
+  </g>
+</svg>

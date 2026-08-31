@@ -45,6 +45,7 @@ androidtvremote2_gtk = ["style.css"]
 
 [tool.setuptools.data-files]
 "share/applications" = ["data/io.github.mrtao.androidtvremote2.desktop"]
+"share/icons/hicolor/scalable/apps" = ["data/icons/hicolor/scalable/apps/io.github.mrtao.androidtvremote2.svg"]
 "share/metainfo" = ["data/io.github.mrtao.androidtvremote2.metainfo.xml"]
 
 [tool.pytest.ini_options]

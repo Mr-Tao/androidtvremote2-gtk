@@ -4,6 +4,16 @@ A native GTK 4 remote control for Android TV and Google TV devices. It uses
 the same Remote Protocol v2 as Google's mobile remote, so it does not require
 ADB, developer mode, or a debug port on the television.
 
+![Android TV Remote controlling a demo television](data/screenshots/android-tv-remote-demo.png)
+
+## Project status
+
+The current release is **0.1.0 (alpha)**. The core device model, secure
+credential storage, connection lifecycle, and remote-control interface have
+automated test coverage. Broader testing with physical Android TV and Google
+TV devices is ongoing; `--demo` exercises the interface without claiming a
+real-device connection.
+
 ## Features
 
 - Automatic mDNS discovery with manual host entry as a fallback.
@@ -15,13 +25,36 @@ ADB, developer mode, or a debug port on the television.
 - Live connection, foreground-app, power, and volume state when reported by
   the device.
 
-## Runtime requirements
+## Install on Arch Linux
+
+The `androidtvremote2-gtk` and `python-androidtvremote2` packages are available
+from the Arch User Repository (AUR). An AUR helper resolves the protocol
+library dependency automatically:
+
+```sh
+yay -S androidtvremote2-gtk
+```
+
+To review and build the packages manually instead:
+
+```sh
+git clone https://aur.archlinux.org/python-androidtvremote2.git
+cd python-androidtvremote2
+makepkg -si
+cd ..
+git clone https://aur.archlinux.org/androidtvremote2-gtk.git
+cd androidtvremote2-gtk
+makepkg -si
+```
+
+## Run from source
 
 The Python dependencies are declared in `pyproject.toml`. Linux distributions
 must additionally provide GTK 4, libadwaita, and PyGObject. On Arch Linux these
 are `gtk4`, `libadwaita`, and `python-gobject`.
 
-Run from a source checkout with system GTK bindings:
+From a source checkout, create a virtual environment that can use the system
+GTK bindings:
 
 ```sh
 python -m venv --system-site-packages .venv

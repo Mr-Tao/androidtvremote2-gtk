@@ -21,8 +21,14 @@
   <provides>
     <binary>androidtvremote2-gtk</binary>
   </provides>
+  <screenshots>
+    <screenshot type="default">
+      <image type="source" width="620" height="760">https://raw.githubusercontent.com/Mr-Tao/androidtvremote2-gtk/main/data/screenshots/android-tv-remote-demo.png</image>
+      <caption>Controlling a connected television in demo mode</caption>
+    </screenshot>
+  </screenshots>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="0.1.0" date="2026-08-31" />
+    <release version="0.1.0" date="2026-09-01" />
   </releases>
 </component>
