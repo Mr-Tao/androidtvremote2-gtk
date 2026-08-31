@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mrtao.androidtvremote2</id>
+  <name>Android TV Remote</name>
+  <summary>Control Android and Google TV devices</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <developer id="io.github.mrtao">
+    <name>Lukas Lipinsky</name>
+  </developer>
+  <description>
+    <p>
+      Android TV Remote is a native GTK remote control using Android TV Remote
+      Protocol v2. It pairs directly with televisions without ADB or developer
+      mode and supports navigation, media, volume, power, and text input.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.mrtao.androidtvremote2.desktop</launchable>
+  <url type="homepage">https://github.com/Mr-Tao/androidtvremote2-gtk</url>
+  <url type="bugtracker">https://github.com/Mr-Tao/androidtvremote2-gtk/issues</url>
+  <provides>
+    <binary>androidtvremote2-gtk</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-08-31" />
+  </releases>
+</component>

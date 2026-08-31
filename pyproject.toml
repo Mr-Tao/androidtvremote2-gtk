@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "androidtvremote2-gtk"
+version = "0.1.0"
+description = "Native GTK remote control for Android and Google TV devices"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+  { name = "Lukas Lipinsky" },
+]
+dependencies = [
+  "androidtvremote2>=0.3.1,<0.4",
+  "zeroconf>=0.100",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: GTK",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Home Automation",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mr-Tao/androidtvremote2-gtk"
+Issues = "https://github.com/Mr-Tao/androidtvremote2-gtk/issues"
+
+[project.gui-scripts]
+androidtvremote2-gtk = "androidtvremote2_gtk.__main__:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+androidtvremote2_gtk = ["style.css"]
+
+[tool.setuptools.data-files]
+"share/applications" = ["data/io.github.mrtao.androidtvremote2.desktop"]
+"share/metainfo" = ["data/io.github.mrtao.androidtvremote2.metainfo.xml"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["A", "ASYNC", "B", "C4", "E", "F", "I", "PIE", "RUF", "SIM", "UP", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/androidtvremote2_gtk/application.py" = ["E402"]
+"src/androidtvremote2_gtk/window.py" = ["E402"]

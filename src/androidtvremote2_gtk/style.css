@@ -1,0 +1,59 @@
+.remote-content {
+  padding: 18px;
+}
+
+.remote-section {
+  margin-top: 12px;
+}
+
+.remote-button {
+  min-width: 46px;
+  min-height: 42px;
+  border-radius: 6px;
+}
+
+.dpad-button {
+  min-width: 58px;
+  min-height: 54px;
+}
+
+.dpad-center {
+  min-width: 62px;
+  min-height: 58px;
+}
+
+.status-dot {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 5px;
+  background: @borders;
+}
+
+.status-dot.connected {
+  background: #2e9b4f;
+}
+
+.status-dot.pending {
+  background: #c88800;
+}
+
+.status-dot.error {
+  background: #c83d4d;
+}
+
+.device-title {
+  font-weight: 700;
+}
+
+.device-detail {
+  opacity: 0.72;
+}
+
+.volume-value {
+  min-width: 52px;
+  font-feature-settings: "tnum";
+}
+
+.pairing-strip {
+  padding: 10px 0;
+}

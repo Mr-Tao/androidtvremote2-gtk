@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test and build dependencies
+        run: python -m pip install '.[test]' build ruff
+      - name: Lint
+        run: ruff check .
+      - name: Check formatting
+        run: ruff format --check .
+      - name: Test
+        run: pytest -q
+      - name: Build distributions
+        run: python -m build
+
+  desktop-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y appstream desktop-file-utils
+      - name: Validate desktop entry
+        run: desktop-file-validate data/io.github.mrtao.androidtvremote2.desktop
+      - name: Validate AppStream metadata
+        run: appstreamcli validate --no-net data/io.github.mrtao.androidtvremote2.metainfo.xml
+
+  arch-gtk-smoke:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install GTK runtime
+        run: >-
+          pacman -Syu --noconfirm --needed
+          dbus gtk4 libadwaita python python-gobject python-zeroconf xorg-server-xvfb
+      - name: Smoke-test GTK startup and shutdown
+        run: |
+          runtime="$(mktemp -d)"
+          home="$(mktemp -d)"
+          env \
+            GSETTINGS_BACKEND=memory \
+            GTK_A11Y=none \
+            HOME="$home" \
+            NO_AT_BRIDGE=1 \
+            PYTHONPATH=src \
+            XDG_CACHE_HOME="$home/cache" \
+            XDG_CONFIG_HOME="$home/config" \
+            XDG_RUNTIME_DIR="$runtime" \
+            dbus-run-session -- xvfb-run -a python -c '
+          from gi.repository import GLib
+          from androidtvremote2_gtk.application import AndroidTVRemoteApplication
+          app = AndroidTVRemoteApplication(demo=True)
+          GLib.timeout_add(1000, lambda: (app.quit(), False)[1])
+          raise SystemExit(app.run(["androidtvremote2-gtk"]))
+          '

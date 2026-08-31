@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+screenshots/
+*.crt
+*.key
+*.pem
+devices.json
+.runtime/
+packaging/arch/*/*.tar.*

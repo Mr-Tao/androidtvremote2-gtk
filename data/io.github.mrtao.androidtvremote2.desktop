@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Android TV Remote
+Comment=Control Android and Google TV devices
+Exec=androidtvremote2-gtk
+Icon=video-display
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=Android;Google TV;Remote;Television;
+StartupNotify=true
