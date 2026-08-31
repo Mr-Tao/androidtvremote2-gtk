@@ -73,7 +73,7 @@ class AddDeviceDialog(Adw.Dialog):
         host_label = Gtk.Label(label="Address", xalign=1)
         self._name = Gtk.Entry(hexpand=True, placeholder_text="Living Room TV")
         self._host = Gtk.Entry(hexpand=True, placeholder_text="tv.local or 192.0.2.10")
-        self._ime = Gtk.Switch(active=True, halign=Gtk.Align.START)
+        self._ime = Gtk.Switch(active=True, halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
         ime_label = Gtk.Label(label="Text input and app state", xalign=1)
         identity_label = Gtk.Label(label="Pairing identity", xalign=1)
         identity_box = Gtk.Box(spacing=6)
