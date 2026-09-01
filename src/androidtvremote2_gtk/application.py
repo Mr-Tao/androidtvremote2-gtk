@@ -67,6 +67,7 @@ class AndroidTVRemoteApplication(Adw.Application):
                 devices = []
             if devices:
                 self._controller.connect(devices[0])
+            self._controller.discover(3.0)
         self._window.present()
 
     def do_shutdown(self) -> None:

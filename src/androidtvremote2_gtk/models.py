@@ -11,6 +11,8 @@ from pathlib import Path
 
 _SLUG_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 _HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+_SERVICE_SUFFIX = "._androidtvremote2._tcp.local."
+_MAC_IDENTIFIER_RE = re.compile(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\Z")
 
 
 def _validate_name(value: str, field: str) -> None:
@@ -42,6 +44,25 @@ def _validate_port(port: int, field: str) -> None:
         raise ValueError(f"{field} must be an integer between 1 and 65535")
 
 
+def _validate_service_name(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value) > 1024
+        or not value.casefold().endswith(_SERVICE_SUFFIX)
+        or not value[: -len(_SERVICE_SUFFIX)]
+    ):
+        raise ValueError("service_name must be a full Android TV Remote DNS-SD instance name")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError("service_name must not contain control characters")
+
+
+def _normalize_service_identifier(value: str) -> str:
+    _validate_name(value, "service_identifier")
+    return value.upper() if _MAC_IDENTIFIER_RE.fullmatch(value) else value
+
+
 class ConnectionStatus(str, Enum):
     """Controller connection lifecycle states."""
 
@@ -67,6 +88,9 @@ class DeviceConfig:
     enable_ime: bool = True
     paired: bool = False
     credential_directory: Path | None = None
+    service_name: str | None = None
+    service_target: str | None = None
+    service_identifier: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not _SLUG_RE.fullmatch(self.id):
@@ -79,6 +103,21 @@ class DeviceConfig:
             raise ValueError("enable_ime must be a boolean")
         if not isinstance(self.paired, bool):
             raise ValueError("paired must be a boolean")
+        if (self.service_name is None) != (self.service_target is None):
+            raise ValueError("service_name and service_target must be provided together")
+        if self.service_name is not None:
+            _validate_service_name(self.service_name)
+            _validate_host(self.service_target)  # type: ignore[arg-type]
+            if not self.service_target.endswith("."):  # type: ignore[union-attr]
+                raise ValueError("service_target must be a fully qualified hostname")
+        if self.service_identifier is not None:
+            if self.service_name is None:
+                raise ValueError("service_identifier requires a DNS-SD service")
+            object.__setattr__(
+                self,
+                "service_identifier",
+                _normalize_service_identifier(self.service_identifier),
+            )
         if self.credential_directory is not None:
             path = Path(self.credential_directory)
             if "\x00" in str(path) or not path.is_absolute() or ".." in path.parts:
@@ -95,11 +134,39 @@ class DiscoveredDevice:
     name: str
     host: str
     port: int = 6466
+    service_name: str | None = None
+    service_target: str | None = None
+    service_identifier: str | None = None
+    addresses: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_name(self.name, "name")
         _validate_host(self.host)
         _validate_port(self.port, "port")
+        if (self.service_name is None) != (self.service_target is None):
+            raise ValueError("service_name and service_target must be provided together")
+        if self.service_name is not None:
+            _validate_service_name(self.service_name)
+            _validate_host(self.service_target)  # type: ignore[arg-type]
+            if not self.service_target.endswith("."):  # type: ignore[union-attr]
+                raise ValueError("service_target must be a fully qualified hostname")
+        if self.service_identifier is not None:
+            if self.service_name is None:
+                raise ValueError("service_identifier requires a DNS-SD service")
+            object.__setattr__(
+                self,
+                "service_identifier",
+                _normalize_service_identifier(self.service_identifier),
+            )
+        if not isinstance(self.addresses, tuple):
+            raise ValueError("addresses must be a tuple")
+        addresses = self.addresses or (self.host,)
+        for address in addresses:
+            _validate_host(address)
+        addresses = tuple(dict.fromkeys(addresses))
+        if self.host not in addresses:
+            raise ValueError("host must be one of the advertised addresses")
+        object.__setattr__(self, "addresses", addresses)
 
     @property
     def display_name(self) -> str:

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import stat
 import threading
 from collections.abc import Callable
@@ -7,7 +8,14 @@ from typing import Any
 
 import pytest
 
-from androidtvremote2_gtk.controller import CannotConnect, ConnectionClosed, InvalidAuth, RemoteController
+from androidtvremote2_gtk.controller import (
+    CannotConnect,
+    ConnectionClosed,
+    InvalidAuth,
+    RemoteController,
+    _wait_remote_closed,
+)
+from androidtvremote2_gtk.discovery import ServiceIdentityError
 from androidtvremote2_gtk.models import ConnectionStatus, DeviceConfig, DiscoveredDevice, RemoteState
 from androidtvremote2_gtk.storage import DeviceStore
 
@@ -49,11 +57,11 @@ class FakeRemote:
         self.connect_exception: Exception | None = None
         self.command_exception: Exception | None = None
         self.command_calls: list[tuple[str, tuple[object, ...], int]] = []
-        self.invalid_auth_callback: Callable[[], None] | None = None
         self.is_on_callbacks: list[Callable[[bool], None]] = []
         self.app_callbacks: list[Callable[[str], None]] = []
         self.volume_callbacks: list[Callable[[dict[str, Any]], None]] = []
-        self.available_callbacks: list[Callable[[bool], None]] = []
+        self.loop: asyncio.AbstractEventLoop = kwargs["loop"]
+        self.closed: asyncio.Future[Exception | None] = self.loop.create_future()
         self.device_info = {"manufacturer": "Example", "model": "Panel", "sw_version": "1.0"}
         self.is_on = True
         self.current_app = "com.example.home"
@@ -78,12 +86,24 @@ class FakeRemote:
 
     def disconnect(self) -> None:
         self.disconnect_calls += 1
+        if not self.closed.done():
+            self.closed.set_result(None)
         if self.disconnect_exception is not None:
             raise self.disconnect_exception
 
+    async def async_wait_closed(self) -> Exception | None:
+        return await asyncio.shield(self.closed)
+
+    def lose_connection(self, reason: Exception | None = None) -> None:
+        def complete() -> None:
+            if not self.closed.done():
+                self.closed.set_result(reason)
+
+        self.loop.call_soon_threadsafe(complete)
+
     def keep_reconnecting(self, invalid_auth_callback: Callable[[], None] | None = None) -> None:
+        del invalid_auth_callback
         self.keep_reconnecting_calls += 1
-        self.invalid_auth_callback = invalid_auth_callback
 
     def add_is_on_updated_callback(self, callback: Callable[[bool], None]) -> None:
         self.is_on_callbacks.append(callback)
@@ -93,9 +113,6 @@ class FakeRemote:
 
     def add_volume_info_updated_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
         self.volume_callbacks.append(callback)
-
-    def add_is_available_updated_callback(self, callback: Callable[[bool], None]) -> None:
-        self.available_callbacks.append(callback)
 
     def _command(self, name: str, *args: object) -> None:
         self.command_calls.append((name, args, threading.get_ident()))
@@ -125,6 +142,22 @@ class FakeFactory:
         return remote
 
 
+def test_wait_remote_closed_supports_pinned_androidtvremote2_0_3_lifecycle() -> None:
+    async def exercise() -> None:
+        connection_lost: asyncio.Future[Exception | None] = asyncio.get_running_loop().create_future()
+        remote = type(
+            "ProtocolOnlyRemote",
+            (),
+            {"_remote_message_protocol": type("Protocol", (), {"on_con_lost": connection_lost})()},
+        )()
+        reason = ConnectionClosed("closed")
+        connection_lost.set_result(reason)
+
+        assert await _wait_remote_closed(remote) is reason  # type: ignore[arg-type]
+
+    asyncio.run(exercise())
+
+
 def make_store(tmp_path: Path) -> DeviceStore:
     return DeviceStore(tmp_path / "config", tmp_path / "data")
 
@@ -151,6 +184,18 @@ def make_controller(
     )
 
 
+def discovered_endpoint(host: str, *, identifier: str = "AA:BB:CC:DD:EE:FF") -> DiscoveredDevice:
+    return DiscoveredDevice(
+        name="TV",
+        host=host,
+        port=6466,
+        service_name="TV._androidtvremote2._tcp.local.",
+        service_target="android-tv.local.",
+        service_identifier=identifier,
+        addresses=(host,),
+    )
+
+
 def test_connect_commands_callbacks_disconnect_and_shutdown(tmp_path: Path) -> None:
     recorder = StateRecorder()
     factory = FakeFactory()
@@ -167,7 +212,7 @@ def test_connect_commands_callbacks_disconnect_and_shutdown(tmp_path: Path) -> N
     assert connected.manufacturer == "Example"
     assert connected.volume_level == 8
     assert connected.current_app == "com.example.home"
-    assert remote.keep_reconnecting_calls == 1
+    assert remote.keep_reconnecting_calls == 0
     assert controller.send_key("HOME").result(timeout=2) is True
     assert controller.send_text("hello").result(timeout=2) is True
     assert controller.launch_app("https://example.test/app").result(timeout=2) is True
@@ -177,18 +222,20 @@ def test_connect_commands_callbacks_disconnect_and_shutdown(tmp_path: Path) -> N
     with recorder.condition:
         assert recorder.condition.wait_for(lambda: controller.state.volume_level == 10, timeout=2)
     assert controller.state.is_muted is True
-    remote.available_callbacks[0](False)
-    recorder.wait_for(ConnectionStatus.RECONNECTING)
-    assert controller.send_key("HOME").result(timeout=2) is False
-    remote.available_callbacks[0](True)
-    recorder.wait_for(ConnectionStatus.CONNECTED)
-    assert remote.invalid_auth_callback is not None
-    remote.invalid_auth_callback()
+    remote.lose_connection(ConnectionClosed("simulated loss"))
+    with recorder.condition:
+        assert recorder.condition.wait_for(
+            lambda: len(factory.remotes) == 2 and controller.state.status is ConnectionStatus.CONNECTED,
+            timeout=2,
+        )
+    replacement = factory.remotes[1]
+    assert replacement is not remote
+    assert controller.send_key("HOME").result(timeout=2) is True
+
+    factory.next_exception = InvalidAuth("invalid on reconnect")
+    replacement.lose_connection(ConnectionClosed("simulated loss"))
     recorder.wait_for(ConnectionStatus.AUTH_REQUIRED)
     assert controller.send_key("HOME").result(timeout=2) is False
-    remote.available_callbacks[0](True)
-    controller._submit(asyncio.sleep(0)).result(timeout=2)
-    assert controller.state.status is ConnectionStatus.AUTH_REQUIRED
 
     assert controller.disconnect().result(timeout=2) is True
     recorder.wait_for(ConnectionStatus.DISCONNECTED)
@@ -197,6 +244,269 @@ def test_connect_commands_callbacks_disconnect_and_shutdown(tmp_path: Path) -> N
     assert controller.state.status is ConnectionStatus.SHUTDOWN
     assert not controller._thread.is_alive()
     assert recorder.dispatch_count == len(recorder.states)
+
+
+def test_dns_sd_endpoint_is_resolved_before_connect_and_persisted_after_auth(tmp_path: Path) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    store = make_store(tmp_path)
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="192.0.2.10",
+        paired=True,
+        service_name="TV._androidtvremote2._tcp.local.",
+        service_target="old-target.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+    )
+    add_managed_credentials(store, device)
+    store.upsert(device)
+    calls: list[tuple[str, str | None, float]] = []
+
+    async def resolver(name: str, identifier: str | None, timeout: float) -> DiscoveredDevice:
+        calls.append((name, identifier, timeout))
+        return discovered_endpoint("192.0.2.25")
+
+    controller = make_controller(recorder, factory, store, service_resolver=resolver)
+
+    assert controller.connect(device).result(timeout=2) is True
+
+    assert calls == [(device.service_name, device.service_identifier, 3.0)]
+    assert factory.remotes[0].kwargs["host"] == "192.0.2.25"
+    assert store.load()[0].host == "192.0.2.25"
+    assert store.load()[0].service_target == "android-tv.local."
+    controller.shutdown().result(timeout=2)
+
+
+def test_dns_sd_resolution_outage_uses_last_known_endpoint(tmp_path: Path) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    store = make_store(tmp_path)
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="192.0.2.10",
+        paired=True,
+        service_name="TV._androidtvremote2._tcp.local.",
+        service_target="android-tv.local.",
+    )
+    add_managed_credentials(store, device)
+
+    async def resolver(_: str, __: str | None, ___: float) -> None:
+        return None
+
+    controller = make_controller(recorder, factory, store, service_resolver=resolver)
+
+    assert controller.connect(device).result(timeout=2) is True
+    assert factory.remotes[0].kwargs["host"] == "192.0.2.10"
+    controller.shutdown().result(timeout=2)
+
+
+def test_dns_sd_identity_conflict_never_constructs_a_fallback_client(tmp_path: Path) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    store = make_store(tmp_path)
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="192.0.2.10",
+        paired=True,
+        service_name="TV._androidtvremote2._tcp.local.",
+        service_target="android-tv.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+    )
+    add_managed_credentials(store, device)
+
+    async def resolver(_: str, __: str | None, ___: float) -> DiscoveredDevice:
+        raise ServiceIdentityError("conflicting bt")
+
+    controller = make_controller(recorder, factory, store, service_resolver=resolver)
+
+    assert controller.connect(device).result(timeout=2) is False
+    assert controller.state.status is ConnectionStatus.FAILED
+    assert factory.remotes == []
+    controller.shutdown().result(timeout=2)
+
+
+def test_each_reconnect_attempt_reresolves_and_uses_a_new_client(tmp_path: Path) -> None:
+    recorder = StateRecorder()
+    store = make_store(tmp_path)
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="192.0.2.10",
+        paired=True,
+        service_name="TV._androidtvremote2._tcp.local.",
+        service_target="android-tv.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+    )
+    add_managed_credentials(store, device)
+    store.upsert(device)
+    endpoints = ["192.0.2.21", "192.0.2.22", "192.0.2.23", "192.0.2.24"]
+    events: list[tuple[str, str]] = []
+
+    async def resolver(_: str, __: str | None, ___: float) -> DiscoveredDevice:
+        host = endpoints[len([event for event in events if event[0] == "resolve"])]
+        events.append(("resolve", host))
+        return discovered_endpoint(host)
+
+    remotes: list[FakeRemote] = []
+
+    def factory(**kwargs: Any) -> FakeRemote:
+        remote = FakeRemote(**kwargs)
+        if len(remotes) in {1, 2}:
+            remote.connect_exception = CannotConnect("simulated retry failure")
+        remotes.append(remote)
+        events.append(("construct", kwargs["host"]))
+        return remote
+
+    controller = RemoteController(
+        recorder.callback,
+        ui_dispatcher=recorder.dispatch,
+        remote_factory=factory,
+        service_resolver=resolver,
+        store=store,
+        connect_timeout=1,
+    )
+    assert controller.connect(device).result(timeout=2) is True
+
+    remotes[0].lose_connection(ConnectionClosed("simulated loss"))
+    with recorder.condition:
+        assert recorder.condition.wait_for(
+            lambda: len(remotes) == 4 and controller.state.status is ConnectionStatus.CONNECTED,
+            timeout=3,
+        )
+
+    assert events == [
+        item
+        for pair in zip(
+            [("resolve", host) for host in endpoints],
+            [("construct", host) for host in endpoints],
+            strict=True,
+        )
+        for item in pair
+    ]
+    assert len({id(remote) for remote in remotes}) == 4
+    assert store.load()[0].host == "192.0.2.24"
+    controller.shutdown().result(timeout=2)
+
+
+def test_pairing_and_post_pair_authentication_resolve_independently(tmp_path: Path) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    store = make_store(tmp_path)
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="192.0.2.10",
+        service_name="TV._androidtvremote2._tcp.local.",
+        service_target="android-tv.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+    )
+    calls = 0
+
+    async def resolver(_: str, __: str | None, ___: float) -> DiscoveredDevice:
+        nonlocal calls
+        calls += 1
+        return discovered_endpoint(f"192.0.2.{20 + calls}")
+
+    controller = make_controller(recorder, factory, store, service_resolver=resolver)
+
+    assert controller.connect(device).result(timeout=2) is True
+    recorder.wait_for(ConnectionStatus.PAIRING)
+    assert controller.finish_pairing("123456").result(timeout=2) is True
+
+    assert calls == 2
+    assert [remote.kwargs["host"] for remote in factory.remotes] == ["192.0.2.21", "192.0.2.22"]
+    assert store.load()[0].paired is True
+    assert store.load()[0].host == "192.0.2.22"
+    controller.shutdown().result(timeout=2)
+
+
+def test_device_switch_during_resolution_constructs_no_stale_remote(tmp_path: Path) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    store = make_store(tmp_path)
+    first = DeviceConfig(
+        id="first",
+        display_name="First",
+        host="192.0.2.10",
+        paired=True,
+        service_name="First._androidtvremote2._tcp.local.",
+        service_target="first.local.",
+    )
+    second = DeviceConfig(id="second", display_name="Second", host="second.local", paired=True)
+    add_managed_credentials(store, first)
+    add_managed_credentials(store, second)
+    resolution_started = threading.Event()
+    resolution_release = threading.Event()
+
+    async def resolver(_: str, __: str | None, ___: float) -> DiscoveredDevice:
+        resolution_started.set()
+        await asyncio.to_thread(resolution_release.wait)
+        return DiscoveredDevice(
+            name="First",
+            host="192.0.2.30",
+            service_name=first.service_name,
+            service_target=first.service_target,
+        )
+
+    controller = make_controller(recorder, factory, store, service_resolver=resolver)
+    stale = controller.connect(first)
+    assert resolution_started.wait(timeout=2)
+
+    assert controller.connect(second).result(timeout=2) is True
+    resolution_release.set()
+
+    assert stale.cancelled()
+    assert [remote.kwargs["host"] for remote in factory.remotes] == ["second.local"]
+    assert controller.state.device_id == "second"
+    controller.shutdown().result(timeout=2)
+
+
+def test_generation_cannot_advance_during_endpoint_client_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    store = make_store(tmp_path)
+    first = DeviceConfig(id="first", display_name="First", host="first.local", paired=True)
+    second = DeviceConfig(id="second", display_name="Second", host="second.local", paired=True)
+    add_managed_credentials(store, first)
+    add_managed_credentials(store, second)
+    construction_started = threading.Event()
+    construction_release = threading.Event()
+    original_credential_paths = store.credential_paths
+
+    def blocking_credential_paths(device: DeviceConfig, *, create: bool = False) -> tuple[Path, Path]:
+        construction_started.set()
+        assert construction_release.wait(timeout=2)
+        return original_credential_paths(device, create=create)
+
+    monkeypatch.setattr(store, "credential_paths", blocking_credential_paths)
+    controller = make_controller(recorder, factory, store)
+    first_future = controller.connect(first)
+    assert construction_started.wait(timeout=2)
+
+    switched: list[concurrent.futures.Future[bool]] = []
+    switch_thread = threading.Thread(target=lambda: switched.append(controller.connect(second)))
+    switch_thread.start()
+    switch_thread.join(timeout=0.05)
+
+    assert switch_thread.is_alive()
+    assert factory.remotes == []
+    assert controller._generation == 1
+
+    construction_release.set()
+    switch_thread.join(timeout=2)
+    assert not switch_thread.is_alive()
+    assert switched[0].result(timeout=2) is True
+    assert first_future.done()
+    if not first_future.cancelled():
+        assert first_future.result(timeout=0) is False
+    assert controller.state.device_id == "second"
+    controller.shutdown().result(timeout=2)
 
 
 def test_new_device_persists_unpaired_then_marks_paired_after_authenticated_connect(tmp_path: Path) -> None:
@@ -273,7 +583,7 @@ def test_first_pairing_auth_failure_can_reset_and_restart_pairing(tmp_path: Path
 
     assert controller.connect(device).result(timeout=2) is True
     recorder.wait_for(ConnectionStatus.PAIRING)
-    factory.remotes[0].connect_exception = InvalidAuth("invalid after pairing")
+    factory.next_exception = InvalidAuth("invalid after pairing")
     assert controller.finish_pairing("123456").result(timeout=2) is False
     recorder.wait_for(ConnectionStatus.AUTH_REQUIRED)
     assert store.load() == [device]
@@ -281,9 +591,9 @@ def test_first_pairing_auth_failure_can_reset_and_restart_pairing(tmp_path: Path
     assert controller.reset_pairing().result(timeout=2) is True
     pairing = recorder.wait_for(ConnectionStatus.PAIRING)
     assert pairing.device == device
-    assert len(factory.remotes) == 2
-    assert factory.remotes[1].generate_calls == 1
-    assert factory.remotes[1].start_pairing_calls == 1
+    assert len(factory.remotes) == 3
+    assert factory.remotes[2].generate_calls == 1
+    assert factory.remotes[2].start_pairing_calls == 1
     controller.shutdown().result(timeout=2)
 
 
@@ -317,7 +627,7 @@ def test_saved_device_invalid_auth_never_regenerates_or_starts_pairing(tmp_path:
     controller.shutdown().result(timeout=2)
 
 
-def test_availability_callback_cannot_bypass_pairing(tmp_path: Path) -> None:
+def test_connection_monitor_does_not_start_before_pairing_authentication(tmp_path: Path) -> None:
     recorder = StateRecorder()
     factory = FakeFactory()
     store = make_store(tmp_path)
@@ -326,7 +636,7 @@ def test_availability_callback_cannot_bypass_pairing(tmp_path: Path) -> None:
 
     assert controller.connect(device).result(timeout=2) is True
     recorder.wait_for(ConnectionStatus.PAIRING)
-    factory.remotes[0].available_callbacks[0](True)
+    factory.remotes[0].lose_connection(ConnectionClosed("pairing transport closed"))
     controller._submit(asyncio.sleep(0)).result(timeout=2)
 
     assert controller.state.status is ConnectionStatus.PAIRING
@@ -334,7 +644,7 @@ def test_availability_callback_cannot_bypass_pairing(tmp_path: Path) -> None:
     controller.shutdown().result(timeout=2)
 
 
-def test_availability_callback_cannot_reopen_failed_connection(tmp_path: Path) -> None:
+def test_failed_connection_has_no_monitor_that_can_reopen_state(tmp_path: Path) -> None:
     recorder = StateRecorder()
     factory = FakeFactory()
     factory.next_exception = CannotConnect("unavailable")
@@ -345,7 +655,7 @@ def test_availability_callback_cannot_reopen_failed_connection(tmp_path: Path) -
 
     assert controller.connect(device).result(timeout=2) is False
     recorder.wait_for(ConnectionStatus.FAILED)
-    factory.remotes[0].available_callbacks[0](True)
+    factory.remotes[0].lose_connection(ConnectionClosed("failed transport closed"))
     controller._submit(asyncio.sleep(0)).result(timeout=2)
 
     assert controller.state.status is ConnectionStatus.FAILED
@@ -402,6 +712,54 @@ def test_pairing_reset_is_rejected_without_auth_required_state(tmp_path: Path) -
     controller.shutdown().result(timeout=2)
 
 
+def test_pairing_reset_commit_is_atomic_with_generation_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = StateRecorder()
+    factory = FakeFactory()
+    factory.next_exception = InvalidAuth("invalid")
+    store = make_store(tmp_path)
+    device = DeviceConfig(id="tv", display_name="TV", host="tv.local", paired=True)
+    replacement = DeviceConfig(id="other", display_name="Other", host="other.local", paired=True)
+    add_managed_credentials(store, device)
+    add_managed_credentials(store, replacement)
+    store.upsert(device)
+    controller = make_controller(recorder, factory, store)
+    assert controller.connect(device).result(timeout=2) is False
+    recorder.wait_for(ConnectionStatus.AUTH_REQUIRED)
+    reset_started = threading.Event()
+    reset_release = threading.Event()
+    original_reset = store.reset_pairing
+
+    def blocking_reset(device_id: str) -> DeviceConfig:
+        reset_started.set()
+        assert reset_release.wait(timeout=2)
+        return original_reset(device_id)
+
+    monkeypatch.setattr(store, "reset_pairing", blocking_reset)
+    reset_future = controller.reset_pairing()
+    assert reset_started.wait(timeout=2)
+    switched: list[concurrent.futures.Future[bool]] = []
+    switch_thread = threading.Thread(target=lambda: switched.append(controller.connect(replacement)))
+    switch_thread.start()
+    switch_thread.join(timeout=0.05)
+
+    assert switch_thread.is_alive()
+    assert controller._generation == 2
+
+    reset_release.set()
+    switch_thread.join(timeout=2)
+    assert not switch_thread.is_alive()
+    assert switched[0].result(timeout=2) is True
+    assert reset_future.done()
+    if not reset_future.cancelled():
+        assert reset_future.result(timeout=0) is False
+    assert store.load()[0].paired is False
+    assert controller.state.device_id == "other"
+    controller.shutdown().result(timeout=2)
+
+
 def test_device_switch_ignores_stale_callbacks(tmp_path: Path) -> None:
     recorder = StateRecorder()
     factory = FakeFactory()
@@ -419,7 +777,8 @@ def test_device_switch_ignores_stale_callbacks(tmp_path: Path) -> None:
     assert controller.state.device_id == "second"
 
     first_remote.app_callbacks[0]("stale.app")
-    first_remote.available_callbacks[0](False)
+    first_remote.lose_connection(ConnectionClosed("stale transport closed"))
+    controller._submit(asyncio.sleep(0)).result(timeout=2)
     assert controller.send_key("HOME").result(timeout=2) is True
     assert controller.state.current_app == "com.example.home"
     assert controller.state.status is ConnectionStatus.CONNECTED
@@ -495,10 +854,22 @@ def test_discovery_callback_is_dispatched(tmp_path: Path) -> None:
     controller.shutdown().result(timeout=2)
 
 
-def test_overlapping_discovery_only_delivers_latest_result(tmp_path: Path) -> None:
+def test_overlapping_discovery_only_delivers_and_reconciles_latest_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     recorder = StateRecorder()
     first_started = threading.Event()
     callback_results: list[tuple[list[DiscoveredDevice], str | None]] = []
+    reconciled: list[list[DiscoveredDevice]] = []
+    store = make_store(tmp_path)
+    original_reconcile = store.reconcile_discovery
+
+    def record_reconcile(devices: list[DiscoveredDevice]) -> list[DeviceConfig]:
+        reconciled.append(list(devices))
+        return original_reconcile(devices)
+
+    monkeypatch.setattr(store, "reconcile_discovery", record_reconcile)
 
     async def fake_discovery(timeout: float) -> list[DiscoveredDevice]:
         if timeout == 1.0:
@@ -512,7 +883,7 @@ def test_overlapping_discovery_only_delivers_latest_result(tmp_path: Path) -> No
         recorder.dispatch,
         remote_factory=FakeFactory(),
         discovery_function=fake_discovery,
-        store=make_store(tmp_path),
+        store=store,
     )
 
     first = controller.discover(1.0)
@@ -521,6 +892,7 @@ def test_overlapping_discovery_only_delivers_latest_result(tmp_path: Path) -> No
 
     assert first.cancelled()
     assert callback_results == [([DiscoveredDevice("Latest", "192.0.2.40")], None)]
+    assert reconciled == [[DiscoveredDevice("Latest", "192.0.2.40")]]
     controller.shutdown().result(timeout=2)
 
 

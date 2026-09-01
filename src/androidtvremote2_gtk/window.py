@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 import uuid
@@ -14,7 +15,7 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gdk, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .models import ConnectionStatus, DeviceConfig, DiscoveredDevice, RemoteState
 from .storage import DeviceStore, DeviceStoreError
@@ -26,6 +27,12 @@ def _device_slug(name: str) -> str:
     normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
     base = re.sub(r"[^a-z0-9]+", "-", normalized.casefold()).strip("-") or "tv"
     return f"{base[:48].rstrip('-')}-{uuid.uuid4().hex[:8]}"
+
+
+def _initial_identity_folder(identity_text: str, config_home: Path, managed_root: Path, home: Path) -> Path:
+    current = Path(identity_text.strip()).expanduser() if identity_text.strip() else None
+    candidates = (current, config_home / "androidtvremote2", managed_root)
+    return next((candidate for candidate in candidates if candidate is not None and candidate.is_dir()), home)
 
 
 class AddDeviceDialog(Adw.Dialog):
@@ -78,7 +85,10 @@ class AddDeviceDialog(Adw.Dialog):
         identity_label = Gtk.Label(label="Pairing identity", xalign=1)
         identity_box = Gtk.Box(spacing=6)
         self._identity = Gtk.Entry(hexpand=True, placeholder_text="Optional existing identity")
-        identity_browse = Gtk.Button(icon_name="document-open-symbolic", tooltip_text="Select pairing identity")
+        identity_browse = Gtk.Button(
+            icon_name="document-open-symbolic",
+            tooltip_text="Select directory containing cert.pem and key.pem",
+        )
         identity_browse.connect("clicked", self._select_identity)
         identity_box.append(self._identity)
         identity_box.append(identity_browse)
@@ -140,7 +150,13 @@ class AddDeviceDialog(Adw.Dialog):
 
     def _select_identity(self, *_: Any) -> None:
         dialog = Gtk.FileDialog(title="Select Pairing Identity")
-        dialog.select_folder(self, None, self._identity_selected)
+        home = Path.home()
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config").expanduser()
+        initial_folder = _initial_identity_folder(
+            self._identity.get_text(), config_home, self._window.store.managed_root, home
+        )
+        dialog.set_initial_folder(Gio.File.new_for_path(str(initial_folder)))
+        dialog.select_folder(self._window, None, self._identity_selected)
 
     def _identity_selected(self, dialog: Gtk.FileDialog, result: Any) -> None:
         try:
@@ -155,7 +171,8 @@ class AddDeviceDialog(Adw.Dialog):
         name = self._name.get_text().strip()
         host = self._host.get_text().strip()
         identity_text = self._identity.get_text().strip()
-        port = self._selected.port if self._selected and self._selected.host == host else 6466
+        selected = self._selected if self._selected and self._selected.host == host else None
+        port = selected.port if selected is not None else 6466
         identity = Path(identity_text).expanduser() if identity_text else None
         if identity is not None and not all((identity / filename).is_file() for filename in ("cert.pem", "key.pem")):
             self._set_error("Select an identity directory containing cert.pem and key.pem.")
@@ -169,6 +186,9 @@ class AddDeviceDialog(Adw.Dialog):
                 enable_ime=self._ime.get_active(),
                 paired=identity is not None,
                 credential_directory=identity,
+                service_name=selected.service_name if selected is not None else None,
+                service_target=selected.service_target if selected is not None else None,
+                service_identifier=selected.service_identifier if selected is not None else None,
             )
         except ValueError:
             self._set_error("Check the device name and address.")
@@ -383,7 +403,11 @@ class RemoteWindow(Adw.ApplicationWindow):
 
     def _reconnect_selected(self, *_: Any) -> None:
         if self._state.device is not None:
-            self.controller.connect(self._state.device)
+            current = next(
+                (device for device in self._devices if device.id == self._state.device.id),
+                self._state.device,
+            )
+            self.controller.connect(current)
         elif self._devices:
             self.controller.connect(self._devices[self._device_dropdown.get_selected()])
 
@@ -396,6 +420,7 @@ class RemoteWindow(Adw.ApplicationWindow):
             self._add_dialog = None
 
     def update_discovery(self, devices: Sequence[DiscoveredDevice], error: str | None = None) -> None:
+        self.refresh_devices(self._state.device_id)
         if self._add_dialog is not None:
             self._add_dialog.update_discovery(devices, error)
 

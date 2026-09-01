@@ -16,7 +16,8 @@ real-device connection.
 
 ## Features
 
-- Automatic mDNS discovery with manual host entry as a fallback.
+- Automatic DNS-SD discovery with fresh endpoint resolution before every
+  connection attempt and manual host entry as a fallback.
 - Per-device pairing identities stored outside the application package.
 - Optional reuse of an existing certificate and key without copying them.
 - Multiple saved televisions with automatic reconnect.
@@ -78,6 +79,14 @@ The application never silently replaces a saved pairing identity. If a TV no
 longer accepts it, the interface requires confirmation before pairing again.
 That action removes an application-managed identity; externally referenced
 credential files are left untouched.
+
+For discovered devices, metadata includes the full DNS-SD service instance,
+its latest SRV target, the optional advertised `bt` identifier, and the last
+known IP address and port. DNS-SD remains authoritative; the numeric endpoint
+is used only when current discovery is unavailable. A conflicting advertised
+identifier stops the connection instead of falling back. Legacy IP-only
+records are upgraded only when exactly one currently advertised service has
+that address.
 
 The application never sends credentials to a discovery service. The underlying
 protocol authenticates with the paired client certificate; like the upstream

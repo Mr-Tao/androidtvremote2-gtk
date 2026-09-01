@@ -25,7 +25,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without the run
         """Fallback used by injected fakes when androidtvremote2 is unavailable."""
 
 
-from .discovery import discover_devices
+from .discovery import ServiceIdentityError, discover_devices, resolve_service
 from .models import ConnectionStatus, DeviceConfig, DiscoveredDevice, RemoteState
 from .storage import DeviceStore, DeviceStoreError
 
@@ -51,15 +51,13 @@ class RemoteClient(Protocol):
 
     def disconnect(self) -> None: ...
 
-    def keep_reconnecting(self, invalid_auth_callback: Callable[[], None] | None = None) -> None: ...
+    async def async_wait_closed(self) -> Exception | None: ...
 
     def add_is_on_updated_callback(self, callback: Callable[[bool], None]) -> None: ...
 
     def add_current_app_updated_callback(self, callback: Callable[[str], None]) -> None: ...
 
     def add_volume_info_updated_callback(self, callback: Callable[[dict[str, Any]], None]) -> None: ...
-
-    def add_is_available_updated_callback(self, callback: Callable[[bool], None]) -> None: ...
 
     def send_key_command(self, code: int | str, direction: int | str = "SHORT") -> None: ...
 
@@ -73,12 +71,25 @@ StateCallback = Callable[[RemoteState], None]
 DiscoveryCallback = Callable[[list[DiscoveredDevice], str | None], None]
 UIDispatcher = Callable[[Callable[[], bool]], object]
 DiscoveryFunction = Callable[[float], Awaitable[list[DiscoveredDevice]]]
+ServiceResolver = Callable[[str, str | None, float], Awaitable[DiscoveredDevice | None]]
 
 
 def _default_remote_factory(**kwargs: Any) -> RemoteClient:
     if AndroidTVRemote is None:
         raise RuntimeError("androidtvremote2 is required unless remote_factory is injected")
     return AndroidTVRemote(**kwargs)
+
+
+async def _wait_remote_closed(remote: RemoteClient) -> Exception | None:
+    """Use the public lifecycle hook when available, with a 0.3.x compatibility path."""
+    wait_closed = getattr(remote, "async_wait_closed", None)
+    if callable(wait_closed):
+        return await wait_closed()
+    protocol = getattr(remote, "_remote_message_protocol", None)
+    connection_lost = getattr(protocol, "on_con_lost", None)
+    if not isinstance(connection_lost, asyncio.Future):
+        raise RuntimeError("The protocol client cannot report connection loss")
+    return await asyncio.shield(connection_lost)
 
 
 class RemoteController:
@@ -92,18 +103,22 @@ class RemoteController:
         *,
         remote_factory: RemoteFactory | None = None,
         discovery_function: DiscoveryFunction | None = None,
+        service_resolver: ServiceResolver | None = None,
         store: DeviceStore | None = None,
         connect_timeout: float = 10.0,
+        resolve_timeout: float = 3.0,
     ) -> None:
-        if connect_timeout <= 0:
-            raise ValueError("connect_timeout must be positive")
+        if connect_timeout <= 0 or resolve_timeout <= 0:
+            raise ValueError("connection and resolution timeouts must be positive")
         self._state_callback = state_callback
         self._discovery_callback = discovery_callback
         self._dispatcher = ui_dispatcher or (lambda callback: callback())
         self._remote_factory = remote_factory or _default_remote_factory
         self._discovery_function = discovery_function or discover_devices
+        self._service_resolver = service_resolver or resolve_service
         self._store = store or DeviceStore()
         self._connect_timeout = connect_timeout
+        self._resolve_timeout = resolve_timeout
 
         self._state_lock = threading.Lock()
         self._state = RemoteState()
@@ -122,6 +137,7 @@ class RemoteController:
         self._device: DeviceConfig | None = None
         self._connect_future: concurrent.futures.Future[bool] | None = None
         self._discovery_future: concurrent.futures.Future[list[DiscoveredDevice]] | None = None
+        self._connection_task: asyncio.Task[None] | None = None
         self._thread_ready = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="androidtvremote2-worker", daemon=True)
         self._thread.start()
@@ -194,6 +210,7 @@ class RemoteController:
     def connect(self, device: DeviceConfig) -> concurrent.futures.Future[bool]:
         """Begin connecting or pairing a device without blocking the caller."""
         generation = self._new_generation()
+        self._cancel_connection_task()
         previous = self._connect_future
         if previous is not None and not previous.done():
             previous.cancel()
@@ -201,52 +218,89 @@ class RemoteController:
         self._connect_future = future
         return future
 
-    async def _connect_device(self, device: DeviceConfig, generation: int) -> bool:
+    async def _connect_device(
+        self,
+        device: DeviceConfig,
+        generation: int,
+        *,
+        reconnecting: bool = False,
+        newly_paired: bool = False,
+    ) -> bool:
         await self._disconnect_remote()
-        self._publish(
-            generation,
-            status=ConnectionStatus.CONNECTING,
-            device=device,
-            manufacturer=None,
-            model=None,
-            software_version=None,
-            is_on=None,
-            volume_level=None,
-            volume_max=None,
-            is_muted=None,
-            current_app=None,
-            error=None,
-        )
-        cert_path, key_path = self._store.credential_paths(device, create=not device.paired)
-        if device.paired and not self._store.credentials_available(device):
+        if generation != self._generation:
+            return False
+        try:
+            device = await self._resolve_device(device)
+        except ServiceIdentityError:
             self._publish(
-                generation, status=ConnectionStatus.AUTH_REQUIRED, error="Saved pairing credentials are unavailable"
+                generation,
+                status=ConnectionStatus.FAILED,
+                device=device,
+                error="The discovered service identity does not match this saved device",
             )
             return False
-
         try:
-            remote = self._remote_factory(
-                client_name=_CLIENT_NAME,
-                certfile=str(cert_path),
-                keyfile=str(key_path),
-                host=device.host,
-                api_port=device.api_port,
-                pair_port=device.pair_port,
-                loop=self._loop,
-                enable_ime=device.enable_ime,
+            with self._state_lock:
+                if generation != self._generation:
+                    return False
+                cert_path, key_path = self._store.credential_paths(device, create=not device.paired)
+                missing_credentials = device.paired and not self._store.credentials_available(device)
+                if not missing_credentials:
+                    remote = self._remote_factory(
+                        client_name=_CLIENT_NAME,
+                        certfile=str(cert_path),
+                        keyfile=str(key_path),
+                        host=device.host,
+                        api_port=device.api_port,
+                        pair_port=device.pair_port,
+                        loop=self._loop,
+                        enable_ime=device.enable_ime,
+                    )
+                    self._remote = remote
+                    self._remote_generation = generation
+                    self._device = device
+            self._publish(
+                generation,
+                status=ConnectionStatus.RECONNECTING if reconnecting else ConnectionStatus.CONNECTING,
+                device=device,
+                manufacturer=None,
+                model=None,
+                software_version=None,
+                is_on=None,
+                volume_level=None,
+                volume_max=None,
+                is_muted=None,
+                current_app=None,
+                error=None,
             )
-            self._remote = remote
-            self._remote_generation = generation
-            self._device = device
+            if missing_credentials:
+                self._publish(
+                    generation,
+                    status=ConnectionStatus.AUTH_REQUIRED,
+                    error="Saved pairing credentials are unavailable",
+                )
+                return False
             self._register_callbacks(remote, generation)
             if not device.paired:
                 await remote.async_generate_cert_if_missing()
-                self._store.secure_credentials(device)
-                self._store.upsert(device)
+                with self._state_lock:
+                    stale = generation != self._generation
+                    if not stale:
+                        self._store.secure_credentials(device)
+                        self._store.upsert(device)
+                if stale:
+                    remote.disconnect()
+                    return False
                 await remote.async_start_pairing()
                 self._publish(generation, status=ConnectionStatus.PAIRING, error=None)
                 return True
-            return await self._authenticate(remote, device, generation, newly_paired=False)
+            return await self._authenticate(
+                remote,
+                device,
+                generation,
+                newly_paired=newly_paired,
+                reconnecting=reconnecting,
+            )
         except asyncio.CancelledError:
             if self._remote_generation == generation:
                 await self._disconnect_remote()
@@ -258,7 +312,11 @@ class RemoteController:
         except (CannotConnect, ConnectionClosed, asyncio.TimeoutError):
             self._mark_not_connected(generation)
             self._disconnect_generation_remote(generation)
-            self._publish(generation, status=ConnectionStatus.FAILED, error="Unable to connect to the device")
+            self._publish(
+                generation,
+                status=ConnectionStatus.RECONNECTING if reconnecting else ConnectionStatus.FAILED,
+                error="Connection interrupted" if reconnecting else "Unable to connect to the device",
+            )
         except (DeviceStoreError, OSError, ValueError):
             self._mark_not_connected(generation)
             self._disconnect_generation_remote(generation)
@@ -270,11 +328,35 @@ class RemoteController:
             self._publish(generation, status=ConnectionStatus.FAILED, error="Unexpected controller error")
         return False
 
+    async def _resolve_device(self, device: DeviceConfig) -> DeviceConfig:
+        if device.service_name is None:
+            return device
+        try:
+            resolved = await self._service_resolver(
+                device.service_name,
+                device.service_identifier,
+                self._resolve_timeout,
+            )
+        except ServiceIdentityError:
+            raise
+        except (OSError, asyncio.TimeoutError):
+            _LOGGER.info("DNS-SD resolution failed; using the last-known endpoint", exc_info=True)
+            return device
+        if resolved is None:
+            return device
+        return replace(
+            device,
+            host=resolved.host,
+            api_port=resolved.port,
+            service_name=resolved.service_name or device.service_name,
+            service_target=resolved.service_target or device.service_target,
+            service_identifier=resolved.service_identifier or device.service_identifier,
+        )
+
     def _register_callbacks(self, remote: RemoteClient, generation: int) -> None:
         remote.add_is_on_updated_callback(lambda value: self._queue_remote_update(generation, is_on=value))
         remote.add_current_app_updated_callback(lambda value: self._queue_remote_update(generation, current_app=value))
         remote.add_volume_info_updated_callback(lambda value: self._queue_volume_update(generation, value))
-        remote.add_is_available_updated_callback(lambda value: self._queue_availability_update(generation, value))
 
     def _queue_on_loop(self, callback: Callable[..., None], *args: object) -> None:
         if threading.current_thread() is self._thread:
@@ -294,36 +376,6 @@ class RemoteController:
                 is_muted=volume.get("muted"),
             )
         )
-
-    def _queue_availability_update(self, generation: int, available: bool) -> None:
-        self._queue_on_loop(self._availability_update, generation, available)
-
-    def _availability_update(self, generation: int, available: bool) -> None:
-        with self._state_lock:
-            if generation != self._generation or self._authenticated_generation != generation:
-                return
-            status = self._state.status
-            if available:
-                if status is not ConnectionStatus.RECONNECTING:
-                    return
-                self._connected_generation = generation
-            else:
-                if status is not ConnectionStatus.CONNECTED:
-                    return
-                self._connected_generation = None
-        if available:
-            self._publish(generation, status=ConnectionStatus.CONNECTED, error=None, **self._snapshot())
-            return
-        self._publish(generation, status=ConnectionStatus.RECONNECTING, error="Connection interrupted")
-
-    def _invalid_auth_update(self, generation: int) -> None:
-        with self._state_lock:
-            if generation != self._generation:
-                return
-            self._authenticated_generation = None
-            self._connected_generation = None
-        self._disconnect_generation_remote(generation)
-        self._publish(generation, status=ConnectionStatus.AUTH_REQUIRED, error="Pairing authentication is required")
 
     def _snapshot(self) -> dict[str, object]:
         remote = self._remote
@@ -349,6 +401,7 @@ class RemoteController:
         generation: int,
         *,
         newly_paired: bool,
+        reconnecting: bool,
     ) -> bool:
         try:
             await asyncio.wait_for(remote.async_connect(), timeout=self._connect_timeout)
@@ -360,30 +413,47 @@ class RemoteController:
         except (CannotConnect, ConnectionClosed, asyncio.TimeoutError):
             self._mark_not_connected(generation)
             self._disconnect_generation_remote(generation)
-            self._publish(generation, status=ConnectionStatus.FAILED, error="Unable to connect to the device")
+            self._publish(
+                generation,
+                status=ConnectionStatus.RECONNECTING if reconnecting else ConnectionStatus.FAILED,
+                error="Connection interrupted" if reconnecting else "Unable to connect to the device",
+            )
             return False
-        if generation != self._generation:
+        connected_device = replace(device, paired=True) if newly_paired else device
+        persistence_error: DeviceStoreError | None = None
+        stale = False
+        with self._state_lock:
+            if generation != self._generation:
+                stale = True
+            else:
+                try:
+                    if newly_paired:
+                        self._store.secure_credentials(device)
+                    if newly_paired or connected_device.service_name is not None:
+                        persisted = next(
+                            (saved for saved in self._store.load() if saved.id == connected_device.id),
+                            None,
+                        )
+                        if persisted != connected_device:
+                            self._store.upsert(connected_device)
+                except DeviceStoreError as exc:
+                    persistence_error = exc
+                if persistence_error is None or not newly_paired:
+                    self._authenticated_generation = generation
+                    self._connected_generation = generation
+        if stale:
             remote.disconnect()
             return False
-
-        connected_device = device
-        if newly_paired:
-            connected_device = replace(device, paired=True)
-            try:
-                self._store.secure_credentials(device)
-                self._store.upsert(connected_device)
-            except DeviceStoreError:
+        if persistence_error is not None:
+            if newly_paired:
                 remote.disconnect()
                 self._publish(generation, status=ConnectionStatus.FAILED, error="Unable to persist the paired identity")
                 return False
-            self._device = connected_device
-        remote.keep_reconnecting(lambda: self._queue_on_loop(self._invalid_auth_update, generation))
-        with self._state_lock:
-            if generation != self._generation:
-                remote.disconnect()
-                return False
-            self._authenticated_generation = generation
-            self._connected_generation = generation
+            _LOGGER.warning(
+                "Unable to persist the last-known DNS-SD endpoint",
+                exc_info=(type(persistence_error), persistence_error, persistence_error.__traceback__),
+            )
+        self._device = connected_device
         self._publish(
             generation,
             status=ConnectionStatus.CONNECTED,
@@ -391,7 +461,75 @@ class RemoteController:
             error=None,
             **self._snapshot(),
         )
+        self._start_connection_monitor(remote, connected_device, generation)
         return True
+
+    def _start_connection_monitor(
+        self,
+        remote: RemoteClient,
+        device: DeviceConfig,
+        generation: int,
+    ) -> None:
+        task = self._loop.create_task(self._monitor_connection(remote, device, generation))
+        with self._state_lock:
+            self._connection_task = task
+
+        def monitor_done(done: asyncio.Task[None]) -> None:
+            with self._state_lock:
+                if self._connection_task is done:
+                    self._connection_task = None
+            if not done.cancelled():
+                exception = done.exception()
+                if exception is not None:
+                    _LOGGER.error(
+                        "Connection monitor failed",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+
+        task.add_done_callback(monitor_done)
+
+    async def _monitor_connection(
+        self,
+        remote: RemoteClient,
+        device: DeviceConfig,
+        generation: int,
+    ) -> None:
+        try:
+            reason = await _wait_remote_closed(remote)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            reason = exc
+        with self._state_lock:
+            current = generation == self._generation and remote is self._remote
+        if not current:
+            return
+        _LOGGER.info("Connection to %s was lost: %s", device.display_name, reason)
+        self._mark_not_connected(generation)
+        self._publish(generation, status=ConnectionStatus.RECONNECTING, error="Connection interrupted")
+        await self._disconnect_remote()
+
+        delay = 0.1
+        while True:
+            with self._state_lock:
+                if generation != self._generation or self._shutdown_started:
+                    return
+            await asyncio.sleep(delay)
+            if await self._connect_device(device, generation, reconnecting=True):
+                return
+            with self._state_lock:
+                status = self._state.status
+                current = generation == self._generation and not self._shutdown_started
+            if not current or status in {ConnectionStatus.AUTH_REQUIRED, ConnectionStatus.FAILED}:
+                return
+            delay = min(delay * 2, 30.0)
+
+    def _cancel_connection_task(self) -> None:
+        with self._state_lock:
+            task = self._connection_task
+            self._connection_task = None
+        if task is not None and not task.done() and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(task.cancel)
 
     def finish_pairing(self, code: str) -> concurrent.futures.Future[bool]:
         """Submit the displayed pairing code without blocking the caller."""
@@ -436,7 +574,11 @@ class RemoteController:
             self._release_pairing_submission(generation)
             self._publish(generation, status=ConnectionStatus.FAILED, error="Unexpected pairing error")
             return False
-        return await self._authenticate(remote, device, generation, newly_paired=True)
+        return await self._connect_device(
+            replace(device, paired=True),
+            generation,
+            newly_paired=True,
+        )
 
     def _release_pairing_submission(self, generation: int) -> None:
         with self._state_lock:
@@ -454,6 +596,7 @@ class RemoteController:
             return future
 
         generation = self._new_generation()
+        self._cancel_connection_task()
         previous = self._connect_future
         if previous is not None and not previous.done():
             previous.cancel()
@@ -463,9 +606,15 @@ class RemoteController:
 
     async def _reset_pairing(self, device: DeviceConfig, generation: int) -> bool:
         await self._disconnect_remote()
-        try:
-            reset_device = self._store.reset_pairing(device.id)
-        except (DeviceStoreError, OSError, ValueError):
+        reset_error: Exception | None = None
+        with self._state_lock:
+            if generation != self._generation:
+                return False
+            try:
+                reset_device = self._store.reset_pairing(device.id)
+            except (DeviceStoreError, OSError, ValueError) as exc:
+                reset_error = exc
+        if reset_error is not None:
             self._publish(
                 generation,
                 status=ConnectionStatus.FAILED,
@@ -478,6 +627,7 @@ class RemoteController:
     def disconnect(self) -> concurrent.futures.Future[bool]:
         """Disconnect the active generation without blocking the caller."""
         generation = self._new_generation()
+        self._cancel_connection_task()
         previous = self._connect_future
         if previous is not None and not previous.done():
             previous.cancel()
@@ -597,6 +747,13 @@ class RemoteController:
         error: str | None = None
         try:
             devices = await self._discovery_function(timeout)
+            with self._state_lock:
+                current = generation == self._discovery_generation and not self._shutdown_started
+                if current:
+                    try:
+                        self._store.reconcile_discovery(devices)
+                    except DeviceStoreError:
+                        _LOGGER.warning("Unable to migrate saved IP endpoints to DNS-SD", exc_info=True)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -628,6 +785,7 @@ class RemoteController:
             generation = self._generation
             completion: concurrent.futures.Future[None] = concurrent.futures.Future()
             self._shutdown_completion = completion
+        self._cancel_connection_task()
         task = asyncio.run_coroutine_threadsafe(self._shutdown(generation), self._loop)
         task.add_done_callback(self._shutdown_finished)
         threading.Thread(

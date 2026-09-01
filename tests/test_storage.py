@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from androidtvremote2_gtk.models import DeviceConfig
+from androidtvremote2_gtk.discovery import SERVICE_TYPE
+from androidtvremote2_gtk.models import DeviceConfig, DiscoveredDevice
 from androidtvremote2_gtk.storage import DeviceStore, DeviceStoreError
 
 
@@ -40,6 +41,64 @@ def test_atomic_roundtrip_is_deterministic_and_private(tmp_path: Path) -> None:
     assert mode(store.managed_root) == 0o700
     assert mode(store.path) == 0o600
     assert not list(store.config_root.glob(".devices.*.tmp"))
+
+
+def test_v1_load_then_write_upgrades_to_v2(tmp_path: Path) -> None:
+    store = DeviceStore(tmp_path / "config", tmp_path / "data")
+    v1_payload = {
+        "version": 1,
+        "devices": [{"id": "tv", "display_name": "TV", "host": "192.0.2.8"}],
+    }
+    store.path.write_text(json.dumps(v1_payload), encoding="utf-8")
+
+    devices = store.load()
+    store.save(devices)
+
+    assert devices == [DeviceConfig(id="tv", display_name="TV", host="192.0.2.8")]
+    assert json.loads(store.path.read_text(encoding="utf-8")) == {
+        "version": 2,
+        "devices": [
+            {
+                "api_port": 6466,
+                "credential_directory": None,
+                "display_name": "TV",
+                "enable_ime": True,
+                "host": "192.0.2.8",
+                "id": "tv",
+                "pair_port": 6467,
+                "paired": False,
+                "service_identifier": None,
+                "service_name": None,
+                "service_target": None,
+            }
+        ],
+    }
+
+
+def test_dns_sd_v2_roundtrip(tmp_path: Path) -> None:
+    store = DeviceStore(tmp_path / "config", tmp_path / "data")
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="192.0.2.8",
+        service_name=f"TV.{SERVICE_TYPE}",
+        service_target="tv.local.",
+        service_identifier="aa:bb:cc:dd:ee:ff",
+    )
+
+    store.save([device])
+
+    assert store.load() == [
+        DeviceConfig(
+            id="tv",
+            display_name="TV",
+            host="192.0.2.8",
+            service_name=f"TV.{SERVICE_TYPE}",
+            service_target="tv.local.",
+            service_identifier="AA:BB:CC:DD:EE:FF",
+        )
+    ]
+    assert json.loads(store.path.read_text(encoding="utf-8"))["version"] == 2
 
 
 def test_external_credentials_are_serialized_as_a_reference(tmp_path: Path) -> None:
@@ -111,7 +170,15 @@ def test_remove_retains_managed_credentials(tmp_path: Path) -> None:
 
 def test_reset_pairing_removes_managed_identity_and_preserves_device(tmp_path: Path) -> None:
     store = DeviceStore(tmp_path / "config", tmp_path / "data")
-    device = DeviceConfig(id="tv", display_name="TV", host="tv.local", paired=True)
+    device = DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="tv.local",
+        paired=True,
+        service_name=f"TV.{SERVICE_TYPE}",
+        service_target="tv.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+    )
     other = DeviceConfig(id="other", display_name="Other", host="other.local", paired=True)
     cert_path, key_path = store.credential_paths(device, create=True)
     cert_path.write_text("certificate", encoding="utf-8")
@@ -120,7 +187,14 @@ def test_reset_pairing_removes_managed_identity_and_preserves_device(tmp_path: P
 
     reset = store.reset_pairing("tv")
 
-    assert reset == DeviceConfig(id="tv", display_name="TV", host="tv.local")
+    assert reset == DeviceConfig(
+        id="tv",
+        display_name="TV",
+        host="tv.local",
+        service_name=f"TV.{SERVICE_TYPE}",
+        service_target="tv.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+    )
     assert store.load() == [other, reset]
     assert not cert_path.parent.exists()
     assert not list(store.managed_root.glob(".tv.forgotten-*"))
@@ -205,6 +279,85 @@ def test_failed_replace_preserves_previous_file(monkeypatch: pytest.MonkeyPatch,
 
     assert store.path.read_bytes() == original_bytes
     assert not list(store.config_root.glob(".devices.*.tmp"))
+
+
+def test_reconcile_discovery_migrates_unique_legacy_ip_match(tmp_path: Path) -> None:
+    store = DeviceStore(tmp_path / "config", tmp_path / "data")
+    legacy = DeviceConfig(
+        id="tv",
+        display_name="Saved TV",
+        host="192.0.2.8",
+        pair_port=7467,
+        enable_ime=False,
+        paired=True,
+    )
+    discovered = DiscoveredDevice(
+        "Advertised TV",
+        "192.0.2.9",
+        port=7466,
+        service_name=f"Advertised TV.{SERVICE_TYPE}",
+        service_target="advertised-tv.local.",
+        service_identifier="AA:BB:CC:DD:EE:FF",
+        addresses=("192.0.2.9", "192.0.2.8"),
+    )
+    store.save([legacy])
+
+    reconciled = store.reconcile_discovery([discovered])
+
+    assert reconciled == [
+        DeviceConfig(
+            id="tv",
+            display_name="Saved TV",
+            host="192.0.2.9",
+            api_port=7466,
+            pair_port=7467,
+            enable_ime=False,
+            paired=True,
+            service_name=f"Advertised TV.{SERVICE_TYPE}",
+            service_target="advertised-tv.local.",
+            service_identifier="AA:BB:CC:DD:EE:FF",
+        )
+    ]
+    assert store.load() == reconciled
+
+
+def test_reconcile_discovery_does_not_migrate_one_legacy_device_to_ambiguous_services(tmp_path: Path) -> None:
+    store = DeviceStore(tmp_path / "config", tmp_path / "data")
+    legacy = DeviceConfig(id="tv", display_name="TV", host="192.0.2.8")
+    services = [
+        DiscoveredDevice(
+            name,
+            host,
+            service_name=f"{name}.{SERVICE_TYPE}",
+            service_target=f"{name.casefold()}.local.",
+            addresses=(host, "192.0.2.8"),
+        )
+        for name, host in (("First", "192.0.2.9"), ("Second", "192.0.2.10"))
+    ]
+    store.save([legacy])
+    original = store.path.read_bytes()
+
+    assert store.reconcile_discovery(services) == [legacy]
+    assert store.path.read_bytes() == original
+
+
+def test_reconcile_discovery_does_not_migrate_ambiguous_legacy_devices(tmp_path: Path) -> None:
+    store = DeviceStore(tmp_path / "config", tmp_path / "data")
+    devices = [
+        DeviceConfig(id="first", display_name="First", host="192.0.2.8"),
+        DeviceConfig(id="second", display_name="Second", host="192.0.2.8"),
+    ]
+    service = DiscoveredDevice(
+        "TV",
+        "192.0.2.8",
+        service_name=f"TV.{SERVICE_TYPE}",
+        service_target="tv.local.",
+    )
+    store.save(devices)
+    original = store.path.read_bytes()
+
+    assert store.reconcile_discovery([service]) == devices
+    assert store.path.read_bytes() == original
 
 
 @pytest.mark.parametrize(

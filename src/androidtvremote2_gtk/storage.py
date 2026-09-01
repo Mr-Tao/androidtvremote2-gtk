@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -9,17 +10,19 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import uuid
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .models import DeviceConfig
+from .models import DeviceConfig, DiscoveredDevice
 
-_STORE_VERSION = 1
+_STORE_VERSION = 2
 _LOGGER = logging.getLogger(__name__)
 _SLUG_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
-_DEVICE_KEYS = {
+_DEVICE_KEYS_V1 = {
     "id",
     "display_name",
     "host",
@@ -28,6 +31,11 @@ _DEVICE_KEYS = {
     "enable_ime",
     "paired",
     "credential_directory",
+}
+_DEVICE_KEYS_V2 = _DEVICE_KEYS_V1 | {
+    "service_name",
+    "service_target",
+    "service_identifier",
 }
 
 
@@ -51,6 +59,7 @@ class DeviceStore:
     """Store versioned device metadata separately from managed identities."""
 
     def __init__(self, config_root: Path | None = None, data_root: Path | None = None) -> None:
+        self._lock = threading.RLock()
         self.config_root = Path(config_root) if config_root is not None else _default_config_root()
         self.data_root = Path(data_root) if data_root is not None else _default_data_root()
         self.path = self.config_root / "devices.json"
@@ -131,27 +140,29 @@ class DeviceStore:
 
     def load(self) -> list[DeviceConfig]:
         """Load and validate devices, returning them in stable ID order."""
-        if not self.path.exists():
-            return []
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            devices = self._decode(raw)
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
-            raise DeviceStoreError("Device metadata is malformed or schema-invalid") from exc
-        return sorted(devices, key=lambda device: device.id)
+        with self._lock:
+            if not self.path.exists():
+                return []
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                devices = self._decode(raw)
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                raise DeviceStoreError("Device metadata is malformed or schema-invalid") from exc
+            return sorted(devices, key=lambda device: device.id)
 
     @staticmethod
     def _decode(raw: Any) -> list[DeviceConfig]:
         if not isinstance(raw, dict) or set(raw) != {"version", "devices"}:
             raise ValueError("invalid root schema")
-        if type(raw["version"]) is not int or raw["version"] != _STORE_VERSION:
+        if type(raw["version"]) is not int or raw["version"] not in {1, _STORE_VERSION}:
             raise ValueError("unsupported store version")
         if not isinstance(raw["devices"], list):
             raise ValueError("devices must be a list")
         devices: list[DeviceConfig] = []
         seen: set[str] = set()
+        allowed_keys = _DEVICE_KEYS_V1 if raw["version"] == 1 else _DEVICE_KEYS_V2
         for item in raw["devices"]:
-            if not isinstance(item, dict) or not {"id", "display_name", "host"} <= set(item) <= _DEVICE_KEYS:
+            if not isinstance(item, dict) or not {"id", "display_name", "host"} <= set(item) <= allowed_keys:
                 raise ValueError("invalid device schema")
             credential_directory = item.get("credential_directory")
             if credential_directory is not None and not isinstance(credential_directory, str):
@@ -165,6 +176,9 @@ class DeviceStore:
                 enable_ime=item.get("enable_ime", True),
                 paired=item.get("paired", False),
                 credential_directory=(Path(credential_directory) if credential_directory is not None else None),
+                service_name=item.get("service_name"),
+                service_target=item.get("service_target"),
+                service_identifier=item.get("service_identifier"),
             )
             if device.id in seen:
                 raise ValueError("duplicate device id")
@@ -183,50 +197,104 @@ class DeviceStore:
             "id": device.id,
             "pair_port": device.pair_port,
             "paired": device.paired,
+            "service_identifier": device.service_identifier,
+            "service_name": device.service_name,
+            "service_target": device.service_target,
         }
 
     def save(self, devices: Iterable[DeviceConfig]) -> None:
         """Atomically replace the metadata file with deterministic JSON."""
-        ordered = sorted(devices, key=lambda device: device.id)
-        if len({device.id for device in ordered}) != len(ordered):
-            raise ValueError("device IDs must be unique")
-        payload = {"devices": [self._encode(device) for device in ordered], "version": _STORE_VERSION}
-        content = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        descriptor = -1
-        temporary_path: Path | None = None
-        try:
-            descriptor, name = tempfile.mkstemp(prefix=".devices.", suffix=".tmp", dir=self.config_root)
-            temporary_path = Path(name)
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                descriptor = -1
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, self.path)
-            temporary_path = None
-            self.path.chmod(0o600)
-            directory_descriptor = os.open(self.config_root, os.O_RDONLY)
+        with self._lock:
+            ordered = sorted(devices, key=lambda device: device.id)
+            if len({device.id for device in ordered}) != len(ordered):
+                raise ValueError("device IDs must be unique")
+            payload = {"devices": [self._encode(device) for device in ordered], "version": _STORE_VERSION}
+            content = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            descriptor = -1
+            temporary_path: Path | None = None
             try:
-                os.fsync(directory_descriptor)
+                descriptor, name = tempfile.mkstemp(prefix=".devices.", suffix=".tmp", dir=self.config_root)
+                temporary_path = Path(name)
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    descriptor = -1
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, self.path)
+                temporary_path = None
+                self.path.chmod(0o600)
+                directory_descriptor = os.open(self.config_root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            except OSError as exc:
+                raise DeviceStoreError("Unable to save device metadata") from exc
             finally:
-                os.close(directory_descriptor)
-        except OSError as exc:
-            raise DeviceStoreError("Unable to save device metadata") from exc
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+                if descriptor >= 0:
+                    os.close(descriptor)
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
 
     def upsert(self, device: DeviceConfig) -> None:
         """Insert or replace one device while preserving stable ordering."""
-        devices = {existing.id: existing for existing in self.load()}
-        devices[device.id] = device
-        self.save(devices.values())
+        with self._lock:
+            devices = {existing.id: existing for existing in self.load()}
+            devices[device.id] = device
+            self.save(devices.values())
+
+    def reconcile_discovery(self, discovered: Iterable[DiscoveredDevice]) -> list[DeviceConfig]:
+        """Attach legacy IP-only records to one unambiguous advertised service."""
+        with self._lock:
+            devices = self.load()
+            legacy_by_address: dict[str, list[DeviceConfig]] = {}
+            for device in devices:
+                if device.service_name is not None:
+                    continue
+                try:
+                    address = str(ipaddress.ip_address(device.host))
+                except ValueError:
+                    continue
+                legacy_by_address.setdefault(address, []).append(device)
+
+            services_by_address: dict[str, dict[str, DiscoveredDevice]] = {}
+            for service in discovered:
+                if service.service_name is None:
+                    continue
+                for advertised in service.addresses:
+                    try:
+                        address = str(ipaddress.ip_address(advertised))
+                    except ValueError:
+                        continue
+                    services_by_address.setdefault(address, {})[service.service_name.casefold()] = service
+
+            replacements: dict[str, DeviceConfig] = {}
+            for address, legacy_devices in legacy_by_address.items():
+                candidates = list(services_by_address.get(address, {}).values())
+                if len(legacy_devices) != 1 or len(candidates) != 1:
+                    continue
+                candidate = candidates[0]
+                replacements[legacy_devices[0].id] = replace(
+                    legacy_devices[0],
+                    host=candidate.host,
+                    api_port=candidate.port,
+                    service_name=candidate.service_name,
+                    service_target=candidate.service_target,
+                    service_identifier=candidate.service_identifier,
+                )
+
+            if replacements:
+                devices = [replacements.get(device.id, device) for device in devices]
+                self.save(devices)
+            return sorted(devices, key=lambda device: device.id)
 
     def remove(self, device_id: str) -> bool:
         """Remove only device metadata, retaining all credential files."""
+        with self._lock:
+            return self._remove(device_id)
+
+    def _remove(self, device_id: str) -> bool:
         self._validate_id(device_id)
         devices = self.load()
         retained = [device for device in devices if device.id != device_id]
@@ -241,6 +309,10 @@ class DeviceStore:
         External credentials are never modified. A managed identity is first
         moved aside so a metadata write failure can restore it without loss.
         """
+        with self._lock:
+            return self._reset_pairing(device_id)
+
+    def _reset_pairing(self, device_id: str) -> DeviceConfig:
         self._validate_id(device_id)
         devices = self.load()
         try:
@@ -248,14 +320,7 @@ class DeviceStore:
         except StopIteration as exc:
             raise DeviceStoreError("The selected device is not saved") from exc
 
-        reset_device = DeviceConfig(
-            id=device.id,
-            display_name=device.display_name,
-            host=device.host,
-            api_port=device.api_port,
-            pair_port=device.pair_port,
-            enable_ime=device.enable_ime,
-        )
+        reset_device = replace(device, paired=False, credential_directory=None)
         replacement = [reset_device if existing.id == device_id else existing for existing in devices]
 
         quarantined: Path | None = None
